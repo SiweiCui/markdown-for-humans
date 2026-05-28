@@ -435,60 +435,90 @@ export const MathInline = Node.create({
   /**
    * ProseMirror plugin: after every transaction, scan text nodes for $...$
    * patterns and replace them with mathInline nodes.
+   *
+   * Replacements are batched (max 40 per transaction) to avoid oversized
+   * transactions that could cause ProseMirror position-mapping errors on
+   * large documents with many formulas.
    */
   addProseMirrorPlugins() {
+    const MAX_REPLACEMENTS_PER_TX = 40;
+
     return [
       new Plugin({
         key: new PluginKey('mathInlineDetection'),
         appendTransaction: (_transactions, _oldState, newState) => {
-          const { doc, schema } = newState;
-          const mathInlineType = schema.nodes.mathInline;
-          if (!mathInlineType) return;
+          try {
+            const { doc, schema } = newState;
+            const mathInlineType = schema.nodes.mathInline;
+            if (!mathInlineType) return;
 
-          const replacements: { from: number; to: number; latex: string }[] = [];
+            const replacements: { from: number; to: number; latex: string }[] = [];
 
-          doc.descendants((child, pos) => {
-            if (!child.isText) return;
-            const text = child.text || '';
-            if (text.indexOf('$') === -1) return;
+            doc.descendants((child, pos) => {
+              if (replacements.length >= MAX_REPLACEMENTS_PER_TX) return;
+              if (!child.isText) return;
+              const text = child.text || '';
+              if (text.indexOf('$') === -1) return;
 
-            // Skip text with marks (links, bold, etc.) to avoid breaking
-            // link text like [$formula$](url). Use LaTeX commands for
-            // formatting inside math instead.
-            if (child.marks.length > 0) return;
+              // Skip text with marks (links, bold, etc.) to avoid breaking
+              // link text like [$formula$](url). Use LaTeX commands for
+              // formatting inside math instead.
+              if (child.marks.length > 0) return;
 
-            const parent = doc.resolve(pos).parent;
-            const parentType = parent.type.name;
-            if (
-              parentType === 'codeBlock' ||
-              parentType === 'mathBlock' ||
-              parentType === 'mathInline'
-            ) {
-              return;
+              const parent = doc.resolve(pos).parent;
+              const parentType = parent.type.name;
+              if (
+                parentType === 'codeBlock' ||
+                parentType === 'mathBlock' ||
+                parentType === 'mathInline'
+              ) {
+                return;
+              }
+
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              let match: any;
+              const regex = new RegExp(INLINE_MATH_RE.source, 'g');
+              while ((match = regex.exec(text)) !== null) {
+                if (replacements.length >= MAX_REPLACEMENTS_PER_TX) break;
+                if (match.index > 0 && text[match.index - 1] === '\\') continue;
+                replacements.push({
+                  from: pos + match.index,
+                  to: pos + match.index + match[0].length,
+                  latex: match[1],
+                });
+              }
+            });
+
+            if (replacements.length === 0) return;
+
+            // Process in reverse order so position shifts don't break
+            // earlier (leftward) replacements.
+            const tr = newState.tr;
+            for (let i = replacements.length - 1; i >= 0; i--) {
+              const r = replacements[i];
+              try {
+                const mathNode = mathInlineType.create(
+                  { latex: r.latex },
+                  schema.text(r.latex)
+                );
+                // Verify the range is still inside the document
+                if (r.from < 0 || r.to > tr.doc.content.size) continue;
+                if (r.from >= r.to) continue;
+                tr.replaceWith(r.from, r.to, mathNode);
+              } catch {
+                // Skip a single replacement that can't be mapped; the rest
+                // may still succeed. Leftover patterns will be picked up
+                // on the next transaction (e.g. next keystroke).
+              }
             }
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            let match: any;
-            const regex = new RegExp(INLINE_MATH_RE.source, 'g');
-            while ((match = regex.exec(text)) !== null) {
-              if (match.index > 0 && text[match.index - 1] === '\\') continue;
-              replacements.push({
-                from: pos + match.index,
-                to: pos + match.index + match[0].length,
-                latex: match[1],
-              });
-            }
-          });
-
-          if (replacements.length === 0) return;
-
-          const tr = newState.tr;
-          for (let i = replacements.length - 1; i >= 0; i--) {
-            const r = replacements[i];
-            const mathNode = mathInlineType.create({ latex: r.latex }, schema.text(r.latex));
-            tr.replaceWith(r.from, r.to, mathNode);
+            return tr;
+          } catch (e) {
+            // Don't let math detection break the editor. Leftover $...$
+            // patterns will remain as plain text and be retried on the
+            // next document update.
+            console.warn('[MD4H] Math inline detection skipped:', e);
+            return;
           }
-          return tr;
         },
       }),
     ];
